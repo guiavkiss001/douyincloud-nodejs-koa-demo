@@ -1,106 +1,77 @@
 import Koa from 'koa';
 import bodyParser from 'koa-bodyparser';
-import Router from '@koa/router'
-import Redis from 'ioredis';
-import mongoose from 'mongoose';
-import assert from "assert";
+import Router from '@koa/router';
+import https from 'https';
 
-// 初始化各服务的连接 redis, mongo
-async function initService() {
-    const {REDIS_ADDRESS, REDIS_USERNAME, REDIS_PASSWORD, MONGO_ADDRESS, MONGO_USERNAME, MONGO_PASSWORD} = process.env;
-    const [ REDIS_HOST, REDIS_PORT] = REDIS_ADDRESS.split(':');
-    const redis = new Redis({
-        port: parseInt(REDIS_PORT, 10),
-        host: REDIS_HOST,
-        username: REDIS_USERNAME,
-        password: REDIS_PASSWORD,
-        db: 0,
+const app = new Koa();
+const router = new Router();
+
+// 从环境变量读取豆包(火山引擎方舟)配置，在抖音云"服务设置-环境变量"里配置
+const ARK_API_KEY = process.env.ARK_API_KEY || '';
+const ARK_MODEL = process.env.ARK_MODEL || 'doubao-seed-1-6-250615';
+
+function callArk(name: string): Promise<string[]> {
+  const prompt = '你是动物生存环境讲解助手。请用生活化的中文，用1-3条要点讲清楚「' + name + '」适宜的生存环境，要点包括：栖息地类型、适宜温度或气候、主要食物来源、生存特点或天敌。每条不超过35字，直接输出要点，用换行分隔，不要任何前言和序号。';
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      model: ARK_MODEL,
+      messages: [
+        { role: 'system', content: '你只输出要点，不要多余的话。' },
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0.7
     });
-
-    assert(await redis.echo('echo') === 'echo', `redis echo error`);
-
-    const mongoUrl = `mongodb://${MONGO_USERNAME}:${encodeURIComponent(MONGO_PASSWORD)}@${MONGO_ADDRESS}`;
-    await mongoose.connect(mongoUrl);    
-
-    return {
-        redis,
-        mongoose,
-    }
+    const req = https.request({
+      hostname: 'ark.cn-beijing.volces.com',
+      path: '/api/v3/chat/completions',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + ARK_API_KEY,
+        'Content-Length': Buffer.byteLength(body)
+      }
+    }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          const content = (json.choices && json.choices[0] && json.choices[0].message && json.choices[0].message.content) || '';
+          const steps = content.split('\n').map((s) => s.replace(/^[\d.\-、\s]+/, '').trim()).filter((s) => s);
+          resolve(steps.length ? steps : ['暂无相关内容']);
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
 }
 
-initService().then(async ({ redis, mongoose}) => {
-    const kittySchema = new mongoose.Schema({
-        name: String
-    });
+router.get('/', (ctx) => {
+  ctx.body = 'Nodejs koa demo project';
+});
 
-    const Kitten = mongoose.model('Kitten', kittySchema);
+// 联网查询动物生存环境讲解（豆包生成）
+router.post('/api/animal', async (ctx) => {
+  const name = ((ctx.request.body && ctx.request.body.name) || '').toString().trim();
+  if (!name) {
+    ctx.body = { success: false, message: 'name is required' };
+    return;
+  }
+  try {
+    const steps = await callArk(name);
+    ctx.body = { success: true, title: name + '适宜的生存环境', steps: steps };
+  } catch (e) {
+    ctx.body = { success: false, message: 'AI request failed' };
+  }
+});
 
-    const app = new Koa();
-
-    const router = new Router();
-    router.get('/', ctx => {
-        ctx.body = `Nodejs koa demo project`;
-    }).get('/api/get_data_from_redis', async(ctx) => {
-        const key = ctx.query.key as string;
-        assert(key?.trim(), `key is required`);
-        const value = await redis.get(key);
-        if (value) {
-            ctx.body = {
-                success: true,
-                data: value,
-            }
-        } else {
-            ctx.status = 404;
-            ctx.body = {
-                success: false,
-                message: `${key} not exist`,
-            }
-        }
-    }).post('/api/set_data_to_redis', async(ctx) => {
-        const key = ctx.query.key as string;
-        const body: any = ctx.request.body;
-        const value = body.value as string;
-        assert(key?.trim(), `key is required`);
-        assert(value?.trim(), `value is required`);
-        await redis.set(key, value);
-        ctx.body = {
-            success: true,
-        }
-    }).get('/api/get_data_from_mongodb', async(ctx) => {
-        const name = ctx.query.name as string;
-        assert(name?.trim(), `name is required`);
-        const data = await Kitten.findOne({ name});
-        
-        if (data) {
-            ctx.body = {
-                success: true,
-                data: data.toJSON(),
-            }
-        } else {
-            ctx.status = 404;
-            ctx.body = {
-                success: false,
-                message: `${name} not exist`,
-            }
-        }
-    }).post('/api/set_data_to_mongodb', async(ctx) => {
-        const name = ctx.query.name as string;
-        assert(name?.trim(), `name is required`);
-
-        const kit = new Kitten({ name });
-        await kit.save();
-
-        ctx.body = {
-            success: true,
-        }
-    });
-
-    app.use(bodyParser());
-    app.use(router.routes());
-
-    const PORT = 8000;
-    app.listen(PORT, () => {
-        console.log(`Server running on port ${PORT}`);
-    });
-
-}).catch((error: string) => console.log("Init service  error: ", error));
+app.use(bodyParser());
+app.use(router.routes());
+const PORT = 8000;
+app.listen(PORT, () => {
+  console.log('Server running on port ' + PORT);
+});
